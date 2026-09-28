@@ -1,0 +1,540 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
+import { createClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/admin";
+import { getUsuarioAtual } from "@/lib/supabase/auth";
+import { parseCsv, gerarSenhaTemporaria } from "@/lib/csv";
+import { enviarEmail, emailAcessoHtml } from "@/lib/email";
+import { getEmpresaBranding } from "@/lib/empresa";
+
+export interface ResultadoCriacao {
+  status: "criado";
+  emailConvite: string;
+}
+
+export interface LinhaImportacao {
+  email: string;
+  nome: string;
+  turma: string | null;
+  status: "criado" | "erro";
+  senhaTemporaria?: string;
+  erro?: string;
+}
+
+export interface ResultadoEnvioEmail {
+  usuarioId: string;
+  nome: string;
+  email: string;
+  ok: boolean;
+  erro?: string;
+}
+
+function aguardar(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// SendGrid limita a taxa de disparo por segundo (varia por plano, mas o padrão
+// gratuito é baixo o suficiente pra estourar em disparos em massa); esse
+// intervalo entre envios evita bater no rate limit. Se ainda assim aparecerem
+// erros de "too many requests" no log, aumente esse valor.
+const INTERVALO_ENTRE_ENVIOS_MS = 1200;
+
+export async function enviarEmailAcesso(usuarioIds: string[]): Promise<ResultadoEnvioEmail[]> {
+  const usuarioAtual = await getUsuarioAtual();
+  if (!usuarioAtual || usuarioAtual.papel !== "admin") return [];
+  if (usuarioIds.length === 0) return [];
+
+  const supabase = await createClient();
+  const admin = createAdminClient();
+  const { data: usuarios } = await supabase
+    .from("usuarios")
+    .select("id, nome, email")
+    .in("id", usuarioIds);
+
+  const origem = process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
+  const empresa = await getEmpresaBranding(usuarioAtual.empresaId);
+  const resultados: ResultadoEnvioEmail[] = [];
+
+  // Um de cada vez, de propósito — a API do SendGrid também tem limite de
+  // requisições por segundo, e disparar tudo em paralelo faz várias baterem
+  // no rate limit ao mesmo tempo (foi o que causou usuários não receberem
+  // e-mail num envio em massa anterior, sem nenhum registro de quem falhou).
+  // Em vez de mandar um link de redefinição (que depende de sessão PKCE e é
+  // de uso único — frágil quando disparado pelo admin pra outra pessoa),
+  // manda a senha provisória direto no e-mail; o usuário troca depois se
+  // quiser em "Minha conta". Cada resultado é gravado em logs_envio_email.
+  for (let i = 0; i < (usuarios ?? []).length; i++) {
+    const usuario = usuarios![i];
+
+    if (i > 0) await aguardar(INTERVALO_ENTRE_ENVIOS_MS);
+
+    const senha = gerarSenhaTemporaria();
+    const { error: erroSenha } = await admin.auth.admin.updateUserById(usuario.id, { password: senha });
+
+    let ok = false;
+    let erro = erroSenha?.message;
+
+    if (!erroSenha) {
+      const envio = await enviarEmail({
+        to: usuario.email,
+        subject: `Seu acesso à plataforma ${empresa?.nome ?? "Care"}`,
+        html: emailAcessoHtml({
+          nomeUsuario: usuario.nome,
+          email: usuario.email,
+          senha,
+          loginUrl: `${origem}/login`,
+          empresaNome: empresa?.nome ?? "Care",
+          logoUrl: empresa?.logoUrl ?? null,
+          corPrimaria: empresa?.corPrimaria ?? null,
+        }),
+      });
+      ok = envio.ok;
+      erro = envio.erro;
+    }
+
+    resultados.push({
+      usuarioId: usuario.id,
+      nome: usuario.nome,
+      email: usuario.email,
+      ok,
+      erro,
+    });
+
+    await supabase.from("logs_envio_email").insert({
+      empresa_id: usuarioAtual.empresaId,
+      usuario_id: usuario.id,
+      nome: usuario.nome,
+      email: usuario.email,
+      ok,
+      erro: erro ?? null,
+      enviado_por: usuarioAtual.id,
+    });
+  }
+
+  return resultados;
+}
+
+export interface LogEnvioEmail {
+  id: string;
+  nome: string;
+  email: string;
+  ok: boolean;
+  erro: string | null;
+  criadoEm: string;
+}
+
+export async function listarLogsEnvioEmail(): Promise<LogEnvioEmail[]> {
+  const usuarioAtual = await getUsuarioAtual();
+  if (!usuarioAtual || usuarioAtual.papel !== "admin") return [];
+
+  const supabase = await createClient();
+  const { data } = await supabase
+    .from("logs_envio_email")
+    .select("id, nome, email, ok, erro, criado_em")
+    .order("criado_em", { ascending: false })
+    .limit(200);
+
+  return (data ?? []).map((l) => ({
+    id: l.id,
+    nome: l.nome,
+    email: l.email,
+    ok: l.ok,
+    erro: l.erro,
+    criadoEm: l.criado_em,
+  }));
+}
+
+export interface StatusAcessoUsuario {
+  id: string;
+  nome: string;
+  email: string;
+  ultimoEnvioOk: boolean | null;
+  ultimoEnvioEm: string | null;
+  primeiroAcessoEm: string | null;
+  senhaAlteradaEm: string | null;
+}
+
+export async function listarStatusAcesso(): Promise<StatusAcessoUsuario[]> {
+  const usuarioAtual = await getUsuarioAtual();
+  if (!usuarioAtual || usuarioAtual.papel !== "admin") return [];
+
+  const supabase = await createClient();
+
+  const [{ data: usuarios }, { data: logs }, { data: eventos }] = await Promise.all([
+    supabase.from("usuarios").select("id, nome, email, senha_alterada_em").order("nome"),
+    supabase
+      .from("logs_envio_email")
+      .select("usuario_id, ok, criado_em")
+      .order("criado_em", { ascending: false }),
+    supabase.from("eventos_acesso").select("usuario_id, ocorrido_em").order("ocorrido_em", { ascending: true }),
+  ]);
+
+  const ultimoEnvioPorUsuario = new Map<string, { ok: boolean; criadoEm: string }>();
+  for (const log of logs ?? []) {
+    if (!log.usuario_id || ultimoEnvioPorUsuario.has(log.usuario_id)) continue;
+    ultimoEnvioPorUsuario.set(log.usuario_id, { ok: log.ok, criadoEm: log.criado_em });
+  }
+
+  const primeiroAcessoPorUsuario = new Map<string, string>();
+  for (const evento of eventos ?? []) {
+    if (primeiroAcessoPorUsuario.has(evento.usuario_id)) continue;
+    primeiroAcessoPorUsuario.set(evento.usuario_id, evento.ocorrido_em);
+  }
+
+  return (usuarios ?? []).map((u) => {
+    const envio = ultimoEnvioPorUsuario.get(u.id);
+    return {
+      id: u.id,
+      nome: u.nome,
+      email: u.email,
+      ultimoEnvioOk: envio?.ok ?? null,
+      ultimoEnvioEm: envio?.criadoEm ?? null,
+      primeiroAcessoEm: primeiroAcessoPorUsuario.get(u.id) ?? null,
+      senhaAlteradaEm: u.senha_alterada_em,
+    };
+  });
+}
+
+export async function criarTurma(_prevState: string | null, formData: FormData) {
+  const usuario = await getUsuarioAtual();
+  if (!usuario || usuario.papel !== "admin") return "Sem permissão.";
+
+  const nome = String(formData.get("nome") ?? "").trim();
+  if (!nome) return "Nome da turma é obrigatório.";
+
+  const supabase = await createClient();
+  const { error } = await supabase
+    .from("turmas")
+    .insert({ empresa_id: usuario.empresaId, nome });
+
+  if (error) return `Erro ao criar turma: ${error.message}`;
+
+  revalidatePath("/admin/usuarios");
+  return null;
+}
+
+export async function editarTurma(turmaId: string, _prevState: string | null, formData: FormData) {
+  const usuario = await getUsuarioAtual();
+  if (!usuario || usuario.papel !== "admin") return "Sem permissão.";
+
+  const nome = String(formData.get("nome") ?? "").trim();
+  if (!nome) return "Nome da turma é obrigatório.";
+
+  const supabase = await createClient();
+  const { error } = await supabase.from("turmas").update({ nome }).eq("id", turmaId);
+  if (error) return `Erro ao salvar: ${error.message}`;
+
+  revalidatePath("/admin/usuarios");
+  return null;
+}
+
+export async function excluirTurma(turmaId: string) {
+  const usuario = await getUsuarioAtual();
+  if (!usuario || usuario.papel !== "admin") return;
+
+  const supabase = await createClient();
+  await supabase.from("turmas").delete().eq("id", turmaId);
+
+  revalidatePath("/admin/usuarios");
+}
+
+async function obterOuCriarTurma(
+  nome: string,
+  empresaId: string,
+  cache: Map<string, string>,
+): Promise<string> {
+  const chave = nome.toLowerCase();
+  if (cache.has(chave)) return cache.get(chave)!;
+
+  const supabase = await createClient();
+  const { data: existente } = await supabase
+    .from("turmas")
+    .select("id")
+    .eq("empresa_id", empresaId)
+    .ilike("nome", nome)
+    .maybeSingle();
+
+  if (existente) {
+    cache.set(chave, existente.id);
+    return existente.id;
+  }
+
+  const { data: nova, error } = await supabase
+    .from("turmas")
+    .insert({ empresa_id: empresaId, nome })
+    .select("id")
+    .single();
+
+  if (error || !nova) throw new Error(`Falha ao criar turma "${nome}": ${error?.message}`);
+
+  cache.set(chave, nova.id);
+  return nova.id;
+}
+
+export async function importarUsuariosCsv(
+  _prevState: LinhaImportacao[] | null,
+  formData: FormData,
+): Promise<LinhaImportacao[]> {
+  const usuario = await getUsuarioAtual();
+  if (!usuario || usuario.papel !== "admin") return [];
+
+  const csvTexto = String(formData.get("csv") ?? "");
+  const linhas = parseCsv(csvTexto);
+
+  const supabase = await createClient();
+  const admin = createAdminClient();
+  const turmaCache = new Map<string, string>();
+  const resultados: LinhaImportacao[] = [];
+
+  for (const linha of linhas) {
+    const email = linha.email?.trim();
+    const nome = (linha.nome || linha.name)?.trim();
+    const turmaNome = (linha.turma || linha.class)?.trim() || null;
+
+    if (!email || !nome) {
+      resultados.push({
+        email: email || "(sem e-mail)",
+        nome: nome || "(sem nome)",
+        turma: turmaNome,
+        status: "erro",
+        erro: "Linha sem nome ou e-mail.",
+      });
+      continue;
+    }
+
+    const senhaTemporaria = gerarSenhaTemporaria();
+
+    const { data: novoAuth, error: erroAuth } = await admin.auth.admin.createUser({
+      email,
+      password: senhaTemporaria,
+      email_confirm: true,
+    });
+
+    if (erroAuth || !novoAuth.user) {
+      resultados.push({
+        email,
+        nome,
+        turma: turmaNome,
+        status: "erro",
+        erro: erroAuth?.message ?? "Falha ao criar usuário.",
+      });
+      continue;
+    }
+
+    const { error: erroUsuario } = await supabase.from("usuarios").insert({
+      id: novoAuth.user.id,
+      empresa_id: usuario.empresaId,
+      nome,
+      email,
+      papel: "aluno",
+    });
+
+    if (erroUsuario) {
+      resultados.push({ email, nome, turma: turmaNome, status: "erro", erro: erroUsuario.message });
+      continue;
+    }
+
+    if (turmaNome) {
+      try {
+        const turmaId = await obterOuCriarTurma(turmaNome, usuario.empresaId, turmaCache);
+        await supabase.from("usuarios_turmas").insert({
+          usuario_id: novoAuth.user.id,
+          turma_id: turmaId,
+        });
+      } catch (e) {
+        resultados.push({
+          email,
+          nome,
+          turma: turmaNome,
+          status: "erro",
+          erro: e instanceof Error ? e.message : "Falha ao vincular turma.",
+        });
+        continue;
+      }
+    }
+
+    resultados.push({ email, nome, turma: turmaNome, status: "criado", senhaTemporaria });
+  }
+
+  revalidatePath("/admin/usuarios");
+  return resultados;
+}
+
+export async function atribuirTrilhaATurma(formData: FormData) {
+  const trilhaId = String(formData.get("trilha_id") ?? "");
+  const turmaId = String(formData.get("turma_id") ?? "");
+  if (!trilhaId || !turmaId) return;
+
+  const supabase = await createClient();
+  await supabase
+    .from("atribuicoes_trilha")
+    .upsert({ trilha_id: trilhaId, turma_id: turmaId }, { onConflict: "trilha_id,turma_id" });
+
+  revalidatePath("/admin/usuarios");
+}
+
+export async function atribuirTrilhaAUsuario(formData: FormData) {
+  const trilhaId = String(formData.get("trilha_id") ?? "");
+  const usuarioId = String(formData.get("usuario_id") ?? "");
+  if (!trilhaId || !usuarioId) return;
+
+  const supabase = await createClient();
+  await supabase
+    .from("atribuicoes_trilha")
+    .upsert({ trilha_id: trilhaId, usuario_id: usuarioId }, { onConflict: "trilha_id,usuario_id" });
+
+  revalidatePath("/admin/usuarios");
+}
+
+export async function removerAtribuicao(atribuicaoId: string) {
+  const supabase = await createClient();
+  await supabase.from("atribuicoes_trilha").delete().eq("id", atribuicaoId);
+  revalidatePath("/admin/usuarios");
+}
+
+export async function criarUsuarioManual(
+  _prevState: string | ResultadoCriacao | null,
+  formData: FormData,
+): Promise<string | ResultadoCriacao> {
+  const usuario = await getUsuarioAtual();
+  if (!usuario || usuario.papel !== "admin") return "Sem permissão.";
+
+  const nome = String(formData.get("nome") ?? "").trim();
+  const email = String(formData.get("email") ?? "").trim().toLowerCase();
+  const papel = String(formData.get("papel") ?? "aluno") === "admin" ? "admin" : "aluno";
+  const turmaId = String(formData.get("turma_id") ?? "").trim();
+
+  if (!nome || !email) return "Nome e e-mail são obrigatórios.";
+
+  const admin = createAdminClient();
+  // Vai de senha provisória mandada direto no e-mail (em vez de link de
+  // redefinição) — o link mágico do Supabase depende de PKCE de sessão e é
+  // de uso único, o que quebra quando disparado pelo admin pra outra pessoa
+  // (ver AGENTS.md). O usuário troca a senha depois se quiser, em "Minha conta".
+  const senhaInicial = gerarSenhaTemporaria();
+
+  const { data: novoAuth, error: erroAuth } = await admin.auth.admin.createUser({
+    email,
+    password: senhaInicial,
+    email_confirm: true,
+  });
+
+  if (erroAuth || !novoAuth.user) {
+    return erroAuth?.message ?? "Falha ao criar usuário.";
+  }
+
+  const supabase = await createClient();
+  const { error: erroUsuario } = await supabase.from("usuarios").insert({
+    id: novoAuth.user.id,
+    empresa_id: usuario.empresaId,
+    nome,
+    email,
+    papel,
+  });
+
+  if (erroUsuario) {
+    await admin.auth.admin.deleteUser(novoAuth.user.id);
+    return `Erro ao criar usuário: ${erroUsuario.message}`;
+  }
+
+  if (turmaId) {
+    await supabase.from("usuarios_turmas").insert({ usuario_id: novoAuth.user.id, turma_id: turmaId });
+  }
+
+  const origem = process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
+  const empresa = await getEmpresaBranding(usuario.empresaId);
+  const envio = await enviarEmail({
+    to: email,
+    subject: `Seu acesso à plataforma ${empresa?.nome ?? "Care"}`,
+    html: emailAcessoHtml({
+      nomeUsuario: nome,
+      email,
+      senha: senhaInicial,
+      loginUrl: `${origem}/login`,
+      empresaNome: empresa?.nome ?? "Care",
+      logoUrl: empresa?.logoUrl ?? null,
+      corPrimaria: empresa?.corPrimaria ?? null,
+    }),
+  });
+
+  await supabase.from("logs_envio_email").insert({
+    empresa_id: usuario.empresaId,
+    usuario_id: novoAuth.user.id,
+    nome,
+    email,
+    ok: envio.ok,
+    erro: envio.erro ?? null,
+    enviado_por: usuario.id,
+  });
+
+  revalidatePath("/admin/usuarios");
+  return { status: "criado", emailConvite: email };
+}
+
+export async function editarUsuario(
+  usuarioId: string,
+  _prevState: string | null,
+  formData: FormData,
+) {
+  const usuarioAtual = await getUsuarioAtual();
+  if (!usuarioAtual || usuarioAtual.papel !== "admin") return "Sem permissão.";
+
+  const nome = String(formData.get("nome") ?? "").trim();
+  const email = String(formData.get("email") ?? "").trim().toLowerCase();
+  const papel = String(formData.get("papel") ?? "aluno") === "admin" ? "admin" : "aluno";
+  const turmaId = String(formData.get("turma_id") ?? "").trim();
+
+  if (!nome || !email) return "Nome e e-mail são obrigatórios.";
+
+  const admin = createAdminClient();
+  const { error: erroAuth } = await admin.auth.admin.updateUserById(usuarioId, { email });
+  if (erroAuth) return `Erro ao atualizar e-mail: ${erroAuth.message}`;
+
+  const supabase = await createClient();
+  const { error } = await supabase
+    .from("usuarios")
+    .update({ nome, email, papel })
+    .eq("id", usuarioId);
+
+  if (error) return `Erro ao salvar: ${error.message}`;
+
+  await supabase.from("usuarios_turmas").delete().eq("usuario_id", usuarioId);
+  if (turmaId) {
+    await supabase.from("usuarios_turmas").insert({ usuario_id: usuarioId, turma_id: turmaId });
+  }
+
+  revalidatePath("/admin/usuarios");
+  redirect("/admin/usuarios");
+}
+
+export async function resetarSenha(
+  usuarioId: string,
+  _prevState: string | null,
+): Promise<string> {
+  const usuarioAtual = await getUsuarioAtual();
+  if (!usuarioAtual || usuarioAtual.papel !== "admin") return "Sem permissão.";
+
+  const novaSenha = gerarSenhaTemporaria();
+  const admin = createAdminClient();
+  const { error } = await admin.auth.admin.updateUserById(usuarioId, { password: novaSenha });
+
+  if (error) return `Erro: ${error.message}`;
+
+  return novaSenha;
+}
+
+export async function removerUsuario(usuarioId: string) {
+  const usuarioAtual = await getUsuarioAtual();
+  if (!usuarioAtual || usuarioAtual.papel !== "admin") return;
+
+  const admin = createAdminClient();
+  await admin.auth.admin.deleteUser(usuarioId);
+
+  const supabase = await createClient();
+  await supabase.from("usuarios").delete().eq("id", usuarioId);
+
+  revalidatePath("/admin/usuarios");
+  redirect("/admin/usuarios");
+}
