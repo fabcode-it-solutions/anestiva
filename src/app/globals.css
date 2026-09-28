@@ -1,0 +1,121 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+/*
+  Design tokens — "Care Azul"
+  Substitui a paleta Terra: primária derivada de #019cd9 (cor definida pelo
+  cliente), com um acento âmbar quente de apoio pra não deixar o azul frio
+  demais num produto de treinamento em saúde. Neutros passam do creme quente
+  pra um branco-azulado frio, coerente com a primária. Nomenclatura de tokens
+  (MD3-like) e raio de cartão generoso mantidos como antes.
+*/
+:root {
+  --primary: #019cd9;
+  --on-primary: #ffffff;
+  --primary-container: #cfeefb;
+  --on-primary-container: #003548;
+
+  --secondary: #b6752a;
+  --on-secondary: #ffffff;
+  --secondary-container: #f6e3c9;
+  --on-secondary-container: #4a3216;
+
+  --success: #2e7d4f;
+  --on-success: #ffffff;
+  --success-container: #d9ecdf;
+
+  --warning: #a15c1f;
+  --on-warning: #ffffff;
+  --warning-container: #f5e2cd;
+
+  --error: #ba1a1a;
+  --on-error: #ffffff;
+  --error-container: #ffdad6;
+  --on-error-container: #93000a;
+
+  --background: #f4f9fb;
+  --on-background: #14232b;
+
+  --surface: #f4f9fb;
+  --surface-bright: #ffffff;
+  --surface-container-low: #edf3f6;
+  --surface-container: #e6eef2;
+  --surface-container-high: #dee8ec;
+  --surface-container-highest: #d6e2e7;
+
+  --on-surface: #14232b;
+  --on-surface-variant: #49585f;
+  --outline: #7a8a91;
+  --outline-variant: #c5d3d9;
+
+  --font-headline: var(--font-literata), Georgia, serif;
+  --font-body: var(--font-nunito-sans), system-ui, sans-serif;
+
+  --radius-card: 1.25rem;
+  --radius-card-lg: 1.75rem;
+  --radius-pill: 999px;
+
+  --shadow-soft: 0 4px 20px rgba(20, 35, 43, 0.06);
+  --shadow-soft-lg: 0 10px 36px rgba(20, 35, 43, 0.09);
+}
+
+@theme inline {
+  --color-primary: var(--primary);
+  --color-on-primary: var(--on-primary);
+  --color-primary-container: var(--primary-container);
+  --color-on-primary-container: var(--on-primary-container);
+
+  --color-secondary: var(--secondary);
+  --color-on-secondary: var(--on-secondary);
+  --color-secondary-container: var(--secondary-container);
+  --color-on-secondary-container: var(--on-secondary-container);
+
+  --color-success: var(--success);
+  --color-on-success: var(--on-success);
+  --color-success-container: var(--success-container);
+
+  --color-warning: var(--warning);
+  --color-on-warning: var(--on-warning);
+  --color-warning-container: var(--warning-container);
+
+  --color-error: var(--error);
+  --color-on-error: var(--on-error);
+  --color-error-container: var(--error-container);
+  --color-on-error-container: var(--on-error-container);
+
+  --color-background: var(--background);
+  --color-on-background: var(--on-background);
+
+  --color-surface: var(--surface);
+  --color-surface-bright: var(--surface-bright);
+  --color-surface-container-low: var(--surface-container-low);
+  --color-surface-container: var(--surface-container);
+  --color-surface-container-high: var(--surface-container-high);
+  --color-surface-container-highest: var(--surface-container-highest);
+
+  --color-on-surface: var(--on-surface);
+  --color-on-surface-variant: var(--on-surface-variant);
+  --color-outline: var(--outline);
+  --color-outline-variant: var(--outline-variant);
+
+  --font-headline: var(--font-headline);
+  --font-body: var(--font-body);
+
+  --radius-card: var(--radius-card);
+  --radius-card-lg: var(--radius-card-lg);
+  --radius-pill: var(--radius-pill);
+
+  --shadow-soft: var(--shadow-soft);
+  --shadow-soft-lg: var(--shadow-soft-lg);
+}
+
+body {
+  background: var(--color-background);
+  color: var(--color-on-background);
+  font-family: var(--font-body);
+  line-height: 1.6;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-headline);
+}
